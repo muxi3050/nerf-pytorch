@@ -55,14 +55,15 @@ def _minify(basedir, factors=[], resolutions=[]):
             check_output('rm {}/*.{}'.format(imgdir, ext), shell=True)
             print('Removed duplicates')
         print('Done')
-            
-        
-        
-        
+                  
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
-    
+    #poses_bounds.npy是一个Nx17的矩阵，其中N是图像的数量，即每一张图像有17个参数。其中前面15个参数可以重排成3x5的矩阵形式
+    #左边3x3矩阵是c2w的旋转矩阵，第四列是c2w的平移向量，第五列分别是图像的高H、宽W和相机的焦距f
+    #最后两个参数用于表示场景的范围Bounds (bds)，是该相机视角下场景点离相机中心最近(near)和最远(far)的距离
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
+    #每个图片前15个参数抽取出来，poses.shape = (3,5,N)
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
+    #最后两个参数，bds.shape = (2,N) 
     bds = poses_arr[:, -2:].transpose([1,0])
     
     img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
@@ -97,7 +98,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
-    
+    #将所有图片都h和w设置成和第一张图片相同，焦距f变为原来 1/factor
     sh = imageio.imread(imgfiles[0]).shape
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
@@ -110,22 +111,26 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             return imageio.imread(f, ignoregamma=True)
         else:
             return imageio.imread(f)
-        
+    # 将像素值转为[0，1]之间
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
     return poses, bds, imgs
 
-    
-            
-            
-    
-
 def normalize(x):
     return x / np.linalg.norm(x)
 
 def viewmatrix(z, up, pos):
+    '''
+    view_matrix是一个构造相机矩阵的的函数，输入是相机的Z轴朝向、up轴的朝向(即相机平面朝上的方向Y)、以及相机中心。
+    输出camera-to-world (c2w)矩阵。因为Z轴朝向，Y轴朝向，和相机中心都已经给定，所以只需求X轴的方向即可。
+    又由于X轴同时和Z轴和Y轴垂直，我们可以用Y轴与Z轴的叉乘得到X轴方向。
+    '''
+    '''
+    在用Y轴与Z轴叉乘得到X轴后，再次用Z轴与X轴叉乘得到新的Y轴。
+    因为传入的up(Y)轴是通过一些计算得到的，不一定和Z轴垂直
+    '''
     vec2 = normalize(z)
     vec1_avg = up
     vec0 = normalize(np.cross(vec1_avg, vec2))
@@ -138,19 +143,25 @@ def ptstocam(pts, c2w):
     return tt
 
 def poses_avg(poses):
-
+    '''
+    多个相机的平均位姿（包括位置和朝向）。输入是多个相机的位姿。
+    第一步对多个相机的中心进行求均值得到center。
+    第二步对所有相机的Z轴求平均得到vec2向量（方向向量相加其实等效于平均方向向量）。
+    第三步对所有的相机的Y轴求平均得到up向量。
+    最后将vec2, up, 和center输入到viewmatrix()函数就可以得到平均的相机位姿了。
+    '''
+    #poses.shape = (N,3,5)
     hwf = poses[0, :3, -1:]
 
     center = poses[:, :3, 3].mean(0)
-    vec2 = normalize(poses[:, :3, 2].sum(0))
-    up = poses[:, :3, 1].sum(0)
+    vec2 = normalize(poses[:, :3, 2].sum(0)) #z
+    up = poses[:, :3, 1].sum(0) #y
     c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
     
     return c2w
 
-
-
 def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, rots, N):
+    # 主要是用来生成一个相机轨迹用于新视角的合成,就像展示视频里面一样
     render_poses = []
     rads = np.array(list(rads) + [1.])
     hwf = c2w[:,4:5]
@@ -160,18 +171,24 @@ def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, rots, N):
         z = normalize(c - np.dot(c2w[:3,:4], np.array([0,0,-focal, 1.])))
         render_poses.append(np.concatenate([viewmatrix(z, up, c), hwf], 1))
     return render_poses
-    
-
 
 def recenter_poses(poses):
-
+    '''
+    输入N个相机位姿，会返回N个相机位姿。
+    第一步先用poses_avg(poses)得到多个输入相机的平均位姿c2w，
+    接着用这个平均位姿c2w的逆左乘到输入的相机位姿上就完成了归一化。自己的均值乘自己。
+    变换后的平均相机位姿的位置处在世界坐标系的原点，XYZ轴朝向和世界坐标系的向一致。
+    '''
+    #poses.shape = (N,3,5)
     poses_ = poses+0
     bottom = np.reshape([0,0,0,1.], [1,4])
+    # c2w.shape = (3,4)
     c2w = poses_avg(poses)
+    # c2w.shape = (4,4)
     c2w = np.concatenate([c2w[:3,:4], bottom], -2)
     bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
     poses = np.concatenate([poses[:,:3,:4], bottom], -2)
-
+    # poses.shape = (N,4,4),c2w是poses的平均值,相当于自己的逆乘自己,得到的是单位矩阵，相当于真实世界坐标
     poses = np.linalg.inv(c2w) @ poses
     poses_[:,:3,:4] = poses[:,:3,:4]
     poses = poses_
@@ -242,12 +259,14 @@ def spherify_poses(poses, bds):
 
 def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
     
-
+    #poses.shape = (3,5,N), bds.shape = (2,N), imgs.shape = (H,W,3,N)
     poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
+    # llff相机坐标系转为nerf相机坐标系
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+    # 转换之后poses.shape = (N,3,5), bds.shape = (N,2), imgs.shape = (N,H,W,3)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
     images = imgs
@@ -260,15 +279,16 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     
     if recenter:
         poses = recenter_poses(poses)
+        # poses.shape = (N,3,5),最后一列不变，其他都转成真实世界坐标原点坐标的偏移
         
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)
 
     else:
         
-        c2w = poses_avg(poses)
+        c2w = poses_avg(poses) #3x5
         print('recentered', c2w.shape)
-        print(c2w[:3,:4])
+        print(c2w[:3,:4]) #[1 0 0 0, 0 1 0 0, 0 0 1 0, 0 0 0 0]
 
         ## Get spiral
         # Get average pose
@@ -312,7 +332,8 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     
     images = images.astype(np.float32)
     poses = poses.astype(np.float32)
-
+    # images.shape = (N,H,W,3) poses.shape = (N,3,5)
+    # bds.shape = (N,2) render_poses.shape = (120,3,5)
     return images, poses, bds, render_poses, i_test
 
 

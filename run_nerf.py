@@ -54,6 +54,11 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
+    '''
+    rays_flat.shape[0]是1024，这里实际上只会进行一次循环，因为chunk是步长，一次就大于shape了，
+    实际上chunk就是一次能进行渲染的光线最大值，这里设置成1024*32，
+    所以rays_flat[i:i+chunk]其实就是输入的rays本身，只有rays更大的时候，chunk才会发挥作用
+    '''
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
@@ -98,7 +103,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     else:
         # use provided ray batch
         rays_o, rays_d = rays
-
+    # 通常情况下use_viewdirs为true
     if use_viewdirs:
         # provide ray directions as input
         viewdirs = rays_d
@@ -123,6 +128,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
+    # 通常 rays.shape = (1024,3+3+1+1+3), viewdirs归一化后的方向
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -305,20 +311,11 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False,
-                pytest=False):
+def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False,
+                lindisp=False, perturb=0., N_importance=0, network_fine=None,
+                white_bkgd=False, raw_noise_std=0., verbose=False, pytest=False):
     """Volumetric rendering.
+    ** render_kwargs_train
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
         for sampling along a ray, including: ray origin, ray direction, min
@@ -345,9 +342,9 @@ def render_rays(ray_batch,
       rgb0: See rgb_map. Output for coarse model.
       disp0: See disp_map. Output for coarse model.
       acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
+      z_std: [num_rays]. Standard deviation of distances along ray for each sample.
     """
+    # 将ray_batch 的输入分开拆出rays_o，rays_d，near，far 和 viewdirs
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
@@ -611,7 +608,7 @@ def train():
     H, W, focal = hwf
     H, W = int(H), int(W)
     hwf = [H, W, focal]
-
+    #相机内参
     if K is None:
         K = np.array([
             [focal, 0, 0.5*W],
@@ -714,6 +711,7 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
+            # N_rand is batch size, deault 32*32*4
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]
@@ -816,8 +814,6 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
-
-    
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
 

@@ -164,11 +164,33 @@ def get_rays(H, W, K, c2w):
 
 def get_rays_np(H, W, K, c2w):
     i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    '''
+    i，j为像素点，(i-K[0][2])/K[0][0]和(j-K[1][2])/K[1][1]实际上是在进行相机内参矩阵的反变换，
+    将像素坐标变为相机坐标
+    '''
+    '''
+    给定一张图像的一个像素点，我们的目标是构造以相机中心为起始点，经过相机中心和像素点的射线.
+    一条射线包括一个起始点和一个方向，起点的话就是相机中心。另一个点，是成像平面的像素点。
+    NeRF代码是在相机坐标系下构建射线，然后再通过camera-to-world (c2w)矩阵将射线变换到世界坐标系
+    第一步是要先写出相机中心和像素点在相机坐标系的3D坐标：
+    相机中心的坐标很明显就是[0,0,0]
+    像素点在相机坐标系下的坐标：首先3D像素点的x和y坐标是2D的像素坐标 (i, j)减去光心像素坐标 (cx,cy)，然后z坐标其实就是焦距f (因为图像平面距离相机中心的距离就是焦距f)。
+    第二步只需要用c2w矩阵把相机坐标系下的相机中心和射线方向变换到世界坐标系
+
+    OpenCV/Colmap的相机坐标系里相机的Up/Y朝下, 相机光心朝向+Z轴，
+    而NeRF/OpenGL相机坐标系里相机的Up/朝上，相机光心朝向-Z轴，
+    所以这里代码在方向向量dir的第二和第三项乘了个负号。
+    '''
     dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
+    # 点乘，与c2w.dot(dir)效果相同
+    # c2w.shape=(3,4), rays_d.shape=(800,800,3)
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    # 所有光线都需要平移rays_o，之后才真正是现实世界光线的向量的起点在现实世界的坐标表示
     rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
+    # rays_d.shape=(800,800,3),rays_o.shape=(800,800,3)
+    # o+d 这表示了某个相机姿态下的从相机光心到800*800个像素点的方向在现实世界的坐标表示
     return rays_o, rays_d
 
 

@@ -92,57 +92,6 @@ def save_poses(basedir, poses, pts3d, perm):
     np.save(os.path.join(basedir, 'poses_bounds.npy'), save_arr)
             
 
-
-
-def minify_v0(basedir, factors=[], resolutions=[]):
-    needtoload = False
-    for r in factors:
-        imgdir = os.path.join(basedir, 'images_{}'.format(r))
-        if not os.path.exists(imgdir):
-            needtoload = True
-    for r in resolutions:
-        imgdir = os.path.join(basedir, 'images_{}x{}'.format(r[1], r[0]))
-        if not os.path.exists(imgdir):
-            needtoload = True
-    if not needtoload:
-        return
-    
-    def downsample(imgs, f):
-        sh = list(imgs.shape)
-        sh = sh[:-3] + [sh[-3]//f, f, sh[-2]//f, f, sh[-1]]
-        imgs = np.reshape(imgs, sh)
-        imgs = np.mean(imgs, (-2, -4))
-        return imgs
-    
-    imgdir = os.path.join(basedir, 'images')
-    imgs = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir))]
-    imgs = [f for f in imgs if any([f.endswith(ex) for ex in ['JPG', 'jpg', 'png', 'jpeg', 'PNG']])]
-    imgs = np.stack([imageio.imread(img)/255. for img in imgs], 0)
-    
-    for r in factors + resolutions:
-        if isinstance(r, int):
-            name = 'images_{}'.format(r)
-        else:
-            name = 'images_{}x{}'.format(r[1], r[0])
-        imgdir = os.path.join(basedir, name)
-        if os.path.exists(imgdir):
-            continue
-        print('Minifying', r, basedir)
-        
-        if isinstance(r, int):
-            imgs_down = downsample(imgs, r)
-        else:
-            imgs_down = skimage.transform.resize(imgs, [imgs.shape[0], r[0], r[1], imgs.shape[-1]],
-                                                order=1, mode='constant', cval=0, clip=True, preserve_range=False, 
-                                                 anti_aliasing=True, anti_aliasing_sigma=None)
-        
-        os.makedirs(imgdir)
-        for i in range(imgs_down.shape[0]):
-            imageio.imwrite(os.path.join(imgdir, 'image{:03d}.png'.format(i)), (255*imgs_down[i]).astype(np.uint8))
-            
-
-
-
 def minify(basedir, factors=[], resolutions=[]):
     needtoload = False
     for r in factors:
@@ -194,72 +143,7 @@ def minify(basedir, factors=[], resolutions=[]):
             print('Removed duplicates')
         print('Done')
             
-        
-        
-        
-def load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
-    
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
-    bds = poses_arr[:, -2:].transpose([1,0])
-    
-    img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
-            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
-    sh = imageio.imread(img0).shape
-    
-    sfx = ''
-    
-    if factor is not None:
-        sfx = '_{}'.format(factor)
-        minify(basedir, factors=[factor])
-        factor = factor
-    elif height is not None:
-        factor = sh[0] / float(height)
-        width = int(sh[1] / factor)
-        minify(basedir, resolutions=[[height, width]])
-        sfx = '_{}x{}'.format(width, height)
-    elif width is not None:
-        factor = sh[1] / float(width)
-        height = int(sh[0] / factor)
-        minify(basedir, resolutions=[[height, width]])
-        sfx = '_{}x{}'.format(width, height)
-    else:
-        factor = 1
-    
-    imgdir = os.path.join(basedir, 'images' + sfx)
-    if not os.path.exists(imgdir):
-        print( imgdir, 'does not exist, returning' )
-        return
-    
-    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
-    if poses.shape[-1] != len(imgfiles):
-        print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
-        return
-    
-    sh = imageio.imread(imgfiles[0]).shape
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
-    poses[2, 4, :] = poses[2, 4, :] * 1./factor
-    
-    if not load_imgs:
-        return poses, bds
-    
-    # imgs = [imageio.imread(f, ignoregamma=True)[...,:3]/255. for f in imgfiles]
-    def imread(f):
-        if f.endswith('png'):
-            return imageio.imread(f, ignoregamma=True)
-        else:
-            return imageio.imread(f)
-        
-    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
-    imgs = np.stack(imgs, -1)  
-    
-    print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs
-
-    
             
-            
-    
 def gen_poses(basedir, match_type, factors=None):
     
     files_needed = ['{}.bin'.format(f) for f in ['cameras', 'images', 'points3D']]
