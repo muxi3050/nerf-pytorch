@@ -136,7 +136,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
-    sh = rays_d.shape # [..., 3]
+    sh = rays_d.shape # sh=(1024, 3)
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
@@ -153,6 +153,11 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     # Render and reshape
     # 通常 rays.shape = (1024,3+3+1+1+3), viewdirs归一化后的方向
     all_ret = batchify_rays(rays, chunk, **kwargs)
+    '''
+    rgb_map.shape=(1024,3),disp_map.shape=(1024),acc_map.shape=(1024),raw.shape=(1024,64+128,4)
+    rgb0.shape=(1024,3),disp0.shape=(1024),acc0.shape=(1024),z_std.shape=(1024)
+    '''
+    # 以下代码，将上面这些变量的第一个维度都变成1024
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -309,29 +314,39 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # aw2alpha求解的是论文中公式(3)中的透明度alpha = 1-exp(-σiδi)
+    # 公式(3)中ci其实就是各点的RGB值，σi是网络输出的密度值， δi是计算得到的各点之间的步长dists
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
+    # z_vals.shape = (1024,64) 每个区间内随机取样后的结果
+    # dists变量其实是每两个点之间的距离，也就是[1024,63]，然后再加上一个最远的距离1e10，变成[1024,64]，
+    # 然后再乘上方向向量rays_d的归一化向量，最后就变成在这个方向上的距离了。
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
-
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
-
+    # 读取rgb信息，还用上了sigmoid，重新映射到[0,1]之间，这里如果要添加噪音的话会对alpha乘以噪音。
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
-
+    # 根据论文的公式(3)计算透明度alpha
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    # weights值其实就是T_i*alpha_i,也是公式(5)中的wi
+    # X = torch.ones((alpha.shape[0], 1))：X 是形状为 [1024, 1] 的全 1 矩阵
+    # Y = torch.cat([X, 1.-alpha + 1e-10], -1)：Y 是形状为 [1024, 64+1]，每行的第一个元素为全 1，后i个元素为1.-alpha + 1e-10
+    # cumprod为cumulative product的意思，即累积乘法, 第二个参数是-1，代表行，结果是一个与输入张量相同形状的张量，其中每个元素都是每行上此元素之前所有元素的乘积。
+    # Z = torch.cumprod(Y, -1)：Z 是形状为 [1024, 64+1] 的连乘矩阵，除每行最后一个元素外，第 i个元素依次对应每条光线的 Ti 
+    # 最终再和alpha相乘得到[1024,64]的weights
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    # rgb_map就是weights乘以rgb后，再对64个点的rgb相加，得到最后的输出[1024,3]
+    # rgb_map就是论文中公式(3)的输出
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
-
+    # weights.shape=(1024,64), z_vals.shape=(1024,64)
+    # depth_map就是这1024个点的深度值
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
@@ -418,12 +433,25 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
 #     raw = run_network(pts)
     # raw.shape = (1024,64,4),其中 4=3个rgb+1个体密度
     raw = network_query_fn(pts, viewdirs, network_fn)
+    '''
+        rgb_map: [1024, 3]. Estimated RGB color of a ray.
+        disp_map: [1024]. Disparity map. Inverse of depth map.
+        acc_map: [1024]. Sum of weights along each ray.
+        weights: [1024, 64]. Weights assigned to each sampled color.
+        depth_map: [1024]. Estimated distance to object.
+    '''
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
 
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
-
+        '''
+        N_importance=128，这里是NeRF的Hierarchical volume sampling设计，
+        首先使用分层抽样对第一组Nc位置进行采样，并在这些位置评估“粗糙”网络。给出这个“粗糙”网络的输出，
+        然后我们对每条射线上的点进行更明智的采样，即利用反变换采样从这个分布中采样第二组Nf位置，
+        然后将Nc+Nf采样得到的数据输入“精细”网络，并计算最终渲染的光线颜色C(r)。
+        z_samples就是Nf的计算过程，sample_pdf函数就是反变换采样过程
+        '''
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
@@ -438,6 +466,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    # train()里设置的是true
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -450,6 +479,10 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
 
+    '''
+    rgb_map.shape=(1024,3),disp_map.shape=(1024),acc_map.shape=(1024),raw.shape=(1024,64+128,4)
+    rgb0.shape=(1024,3),disp0.shape=(1024),acc0.shape=(1024),z_std.shape=(1024)
+    '''
     return ret
 
 
