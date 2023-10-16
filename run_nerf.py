@@ -37,16 +37,39 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
+    # pts.shape = (1024,64,3) 是论文中r=o+td 其中t有64个取值
+    # 在这里pts先被转换陈(N_rands*N_samples,3),然后送入embed_fn
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    '''
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    def get_embedder(multires, i=0):
+        embedder_obj = Embedder(**embed_kwargs)
+        embed = lambda x, eo=embedder_obj : eo.embed(x)
+        return embed, embedder_obj.out_dim
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+    self.embed_fns = embed_fns
+    for freq in freq_bands: # 2^0,2^1...2^9
+        for p_fn in self.kwargs['periodic_fns']: # periodic_fns = [torch.sin, torch.cos]
+            # x是（x,y,z）的输入，所以对于每个x，有10*2*3=60个输出函数
+            # 而前面还有embed_fns.append(lambda x : x), 相当于还有三个输入的复制，所以一共3+60=63个输出函数
+            embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
+    '''
+    # embedded.shape = (1024*64,63)
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        # 这里对于每个输入，embeddirs_fn有27个输出函数
+        # embedded_dirs.shape = (1024*64,27)
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+        # embedded.shape = (1024*64,63+27)
         embedded = torch.cat([embedded, embedded_dirs], -1)
-
+    # fn 指的是render_kwargs_train中的'network_fn' : model
+    # outputs_flat.shape = (1024*64,3+1)
     outputs_flat = batchify(fn, netchunk)(embedded)
+    # outputs.shape = (1024,64,4)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
@@ -184,10 +207,18 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # args.multires = 10
+    # x是（x,y,z）的输入，所以对于每个x，有10*2*3=60个输出函数
+    # 而前面还有embed_fns.append(lambda x : x), 相当于还有三个输入的复制，所以一共3+60=63个输出函数
+    # input_ch = 63
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
     embeddirs_fn = None
+    # args.multires_views = 4
+    #  x是（x,y,z）的输入，所以对于每个x，有4*2*3=24个输出函数
+    # 而前面还有embed_fns.append(lambda x : x), 相当于还有三个输入的复制，所以一共3+24=27个输出函数
+    # input_ch_views = 27
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
@@ -350,7 +381,9 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
-
+    # t_vals在（0，1）之间先均匀采样N个点，这里N_samples=64，lindisp是false
+    # z_vals.shape = [1024,64], 通过 t_vals 的值在 near 和 far 之间进行线性插值，从而生成 z_vals。
+    # 此时的z_vals就是公式（2）中的ti
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
@@ -358,10 +391,13 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
     z_vals = z_vals.expand([N_rays, N_samples])
-
+    # 均匀区间内随机产生采样点的过程
+    # perturb 默认值为1.0，并设 pytest 为 false
     if perturb > 0.:
         # get intervals between samples
+        # mids.shape = (1024,63)取的是64个样本中，每两个样本的均值
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # upper.shape = (1024,64),mids拼接了一个最大值
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
@@ -372,13 +408,15 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, retraw=False
             np.random.seed(0)
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
-
+        # z_vals.shape = (1024,64) 每个区间内随机取样后的结果
         z_vals = lower + (upper - lower) * t_rand
-
+    # pts.shape = (1024,64,3) 是论文中r=o+td 其中t有64个取值
+    # 1024代表了有N个射线，64代表了每条射线上的采样点的数量，3则是这些采样点的x,y,z坐标
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
 #     raw = run_network(pts)
+    # raw.shape = (1024,64,4),其中 4=3个rgb+1个体密度
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -711,7 +749,7 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            # N_rand is batch size, deault 32*32*4
+            # N_rand is batch size, deault 32*32*4,但在configs文件中，通常设置为1024
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]

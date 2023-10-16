@@ -29,12 +29,16 @@ class Embedder:
         N_freqs = self.kwargs['num_freqs']
         
         if self.kwargs['log_sampling']:
+            # 2^0,2^1...2^9
             freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
             
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:
+                # periodic_fns = [torch.sin, torch.cos]
+                # x是（x,y,z）的输入，所以对于每个x，有10*2*3=60个输出函数
+                # 而前面还有embed_fns.append(lambda x : x), 相当于还有三个输入的复制，所以一共3+60=63个输出函数
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
                 out_dim += d
                     
@@ -53,7 +57,7 @@ def get_embedder(multires, i=0):
                 'include_input' : True,
                 'input_dims' : 3,
                 'max_freq_log2' : multires-1,
-                'num_freqs' : multires,
+                'num_freqs' : multires, #默认是10
                 'log_sampling' : True,
                 'periodic_fns' : [torch.sin, torch.cos],
     }
@@ -94,6 +98,9 @@ class NeRF(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
+        # input_ch和input_ch_views根据之前的定义分别是63和27
+        # x.shape=(1024*64,63+27)
+        # input_pts=(1024*64,63), input_views=(1024*64,27)
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
         for i, l in enumerate(self.pts_linears):
@@ -101,9 +108,12 @@ class NeRF(nn.Module):
             h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
+        # 至此输出是[1024*64,256]
 
         if self.use_viewdirs:
+            # alpha是体密度输出
             alpha = self.alpha_linear(h)
+            # feature是方向输入，r(d)
             feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
         
@@ -112,6 +122,7 @@ class NeRF(nn.Module):
                 h = F.relu(h)
 
             rgb = self.rgb_linear(h)
+            # RGB+σ作为输出返回，所以返回结果应该是[1024*64,3+1]
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
